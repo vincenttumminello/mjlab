@@ -16,3 +16,6 @@ from mjlab.asset_zoo.robots.unitree_go1.go1_constants import (
 from mjlab.asset_zoo.robots.unitree_go1.go1_constants import (
   get_go1_robot_cfg as get_go1_robot_cfg,
 )
+
+# CartPole robot
+from mjlab.asset_zoo.robots.cartpole.cartpole_constants import get_cartpole_robot_cfg as get_cartpole_robot_cfg
