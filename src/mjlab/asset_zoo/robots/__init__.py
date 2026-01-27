@@ -21,4 +21,10 @@ from mjlab.asset_zoo.robots.unitree_go1.go1_constants import (
 from mjlab.asset_zoo.robots.cartpole.cartpole_constants import get_cartpole_robot_cfg as get_cartpole_robot_cfg
 
 # Nugus Robot
-from mjlab.asset_zoo.robots.nugus.nugus_constants import get_nugus_robot_cfg as get_nugus_robot_cfg
+from mjlab.asset_zoo.robots.nugus.nugus_constants import (
+    NUGUS_ACTION_SCALE as NUGUS_ACTION_SCALE,
+)
+
+from mjlab.asset_zoo.robots.nugus.nugus_constants import (
+    get_nugus_robot_cfg as get_nugus_robot_cfg,
+)
