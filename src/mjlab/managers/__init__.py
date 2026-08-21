@@ -18,11 +18,18 @@ from mjlab.managers.event_manager import EventTermCfg as EventTermCfg
 from mjlab.managers.manager_base import ManagerBase as ManagerBase
 from mjlab.managers.manager_base import ManagerTermBase as ManagerTermBase
 from mjlab.managers.manager_base import ManagerTermBaseCfg as ManagerTermBaseCfg
+from mjlab.managers.metrics_manager import MetricsManager as MetricsManager
+from mjlab.managers.metrics_manager import MetricsTermCfg as MetricsTermCfg
+from mjlab.managers.metrics_manager import NullMetricsManager as NullMetricsManager
 from mjlab.managers.observation_manager import (
   ObservationGroupCfg as ObservationGroupCfg,
 )
 from mjlab.managers.observation_manager import ObservationManager as ObservationManager
 from mjlab.managers.observation_manager import ObservationTermCfg as ObservationTermCfg
+from mjlab.managers.recorder_manager import NullRecorderManager as NullRecorderManager
+from mjlab.managers.recorder_manager import RecorderManager as RecorderManager
+from mjlab.managers.recorder_manager import RecorderTerm as RecorderTerm
+from mjlab.managers.recorder_manager import RecorderTermCfg as RecorderTermCfg
 from mjlab.managers.reward_manager import RewardManager as RewardManager
 from mjlab.managers.reward_manager import RewardTermCfg as RewardTermCfg
 from mjlab.managers.scene_entity_config import SceneEntityCfg as SceneEntityCfg

@@ -2,20 +2,25 @@
 
 from __future__ import annotations
 
+import dataclasses
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
 from enum import Enum
-from typing import TYPE_CHECKING, Generic, TypeVar
+from typing import TYPE_CHECKING, ClassVar, Generic, Literal, TypeVar
 
 import mujoco
 import mujoco_warp as mjwarp
 import torch
+
+from mjlab.utils.buffers import DelayBuffer
 
 if TYPE_CHECKING:
   from mjlab.entity import Entity
   from mjlab.entity.data import EntityData
 
 ActuatorCfgT = TypeVar("ActuatorCfgT", bound="ActuatorCfg")
+
+CommandField = Literal["position", "velocity", "effort"]
 
 
 class TransmissionType(str, Enum):
@@ -31,32 +36,80 @@ class ActuatorCfg(ABC):
   target_names_expr: tuple[str, ...]
   """Targets that are part of this actuator group.
 
-  Can be a tuple of names or tuple of regex expressions.
-  Interpreted based on transmission_type (joint/tendon/site).
+  Can be a tuple of names or tuple of regex expressions. Interpreted based on
+  transmission_type.
   """
 
   transmission_type: TransmissionType = TransmissionType.JOINT
   """Transmission type. Defaults to JOINT."""
 
-  armature: float = 0.0
-  """Reflected rotor inertia."""
+  armature: float | None = None
+  """Reflected rotor inertia. None preserves the XML value."""
 
-  frictionloss: float = 0.0
-  """Friction loss force limit.
+  frictionloss: float | None = None
+  """Friction loss force limit. None preserves the XML value.
 
   Applies a constant friction force opposing motion, independent of load or velocity.
   Also known as dry friction or load-independent friction.
   """
 
+  viscous_damping: float | None = None
+  """Passive viscous damping coefficient. None preserves the XML value.
+
+  Produces a dissipative force f(v) = -b·v proportional to velocity. Always present
+  regardless of actuator activity. Unlike ``damping`` (the PD derivative gain kv, which
+  is active control), this is a passive property.
+
+  Maps to ``<joint damping>`` for JOINT transmission and ``<tendon damping>``
+  for TENDON transmission. Ignored for SITE.
+  """
+
+  delay_min_lag: int = 0
+  """Minimum command delay in physics timesteps.
+
+  Each step, a lag is sampled uniformly from [min, max]. The command target arrives
+  that many steps late at the actuator's control law. Models communication and bus
+  latency between the policy and the motor (as opposed to observation delay, which
+  models sensor pipeline latency).
+  """
+
+  delay_max_lag: int = 0
+  """Maximum command delay in physics timesteps. Set > 0 to enable delay."""
+
+  delay_hold_prob: float = 0.0
+  """Probability of keeping the current lag instead of resampling."""
+
+  delay_update_period: int = 0
+  """How often to resample the lag, in physics timesteps (0 = every step)."""
+
+  delay_per_env_phase: bool = True
+  """Stagger lag resampling across environments so they don't all update
+  on the same step."""
+
   def __post_init__(self) -> None:
-    assert self.armature >= 0.0, "armature must be non-negative."
-    assert self.frictionloss >= 0.0, "frictionloss must be non-negative."
+    if self.armature is not None:
+      assert self.armature >= 0.0, "armature must be non-negative."
+    if self.frictionloss is not None:
+      assert self.frictionloss >= 0.0, "frictionloss must be non-negative."
+    if self.viscous_damping is not None:
+      assert self.viscous_damping >= 0.0, "viscous_damping must be non-negative."
     if self.transmission_type == TransmissionType.SITE:
-      if self.armature > 0.0 or self.frictionloss > 0.0:
+      if (
+        (self.armature is not None and self.armature > 0.0)
+        or (self.frictionloss is not None and self.frictionloss > 0.0)
+        or (self.viscous_damping is not None and self.viscous_damping > 0.0)
+      ):
         raise ValueError(
-          f"{self.__class__.__name__}: armature and frictionloss are not supported for "
-          "SITE transmission type."
+          f"{self.__class__.__name__}: armature, frictionloss, and viscous_damping are "
+          "not supported for SITE transmission type."
         )
+    assert self.delay_min_lag >= 0, "delay_min_lag must be non-negative."
+    assert self.delay_max_lag >= 0, "delay_max_lag must be non-negative."
+    assert self.delay_min_lag <= self.delay_max_lag, (
+      "delay_min_lag must be <= delay_max_lag."
+    )
+    assert 0.0 <= self.delay_hold_prob <= 1.0, "delay_hold_prob must be in [0, 1]."
+    assert self.delay_update_period >= 0, "delay_update_period must be non-negative."
 
   @abstractmethod
   def build(
@@ -95,8 +148,57 @@ class ActuatorCmd:
   """Current velocities (joint velocities, tendon velocities, or site velocities)."""
 
 
+def delay_command(
+  buffer: DelayBuffer,
+  position_target: torch.Tensor,
+  velocity_target: torch.Tensor,
+  effort_target: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+  """Delay the three command-target fields through one shared channel.
+
+  Every target the policy issues (position, velocity, effort) travels the same
+  command bus and incurs the same latency, so they are stacked and delayed
+  together by a single DelayBuffer. Feedback (pos, vel) is never delayed. Shared
+  by Actuator.apply_delay and the fused group so the command-delay semantics
+  live in exactly one place.
+
+  Args:
+    buffer: The delay buffer to append to and read the delayed command from.
+    position_target: Position targets, shape (num_envs, num_targets).
+    velocity_target: Velocity targets, shape (num_envs, num_targets).
+    effort_target: Feedforward effort targets, shape (num_envs, num_targets).
+
+  Returns:
+    The delayed (position_target, velocity_target, effort_target) tuple.
+  """
+  stacked = torch.stack((position_target, velocity_target, effort_target), dim=-1)
+  buffer.append(stacked)
+  delayed = buffer.compute()
+  return delayed[..., 0], delayed[..., 1], delayed[..., 2]
+
+
 class Actuator(ABC, Generic[ActuatorCfgT]):
   """Base actuator interface."""
+
+  # Fusion contract. An actuator whose control output is a stateless function of
+  # per-target parameters and the command implements control_law over the
+  # parameter tensors named in param_names, and applies it through the shared
+  # compute (see IdealPdActuator). Such actuators are fused automatically (see
+  # mjlab.actuator.fused_group). Actuators with a custom compute (built-ins, XML,
+  # learned networks) are not fused; they need no opt-out flag, since overriding
+  # compute is itself the signal.
+  param_names: ClassVar[tuple[str, ...]] = ()
+
+  @staticmethod
+  def control_law(params: dict[str, torch.Tensor], cmd: ActuatorCmd) -> torch.Tensor:
+    """Stateless control law over per-target parameters.
+
+    params maps each name in param_names to its tensor of shape
+    (num_envs, num_targets); for a fused group these are the concatenated
+    tensors. Returns the control signal of the same trailing shape. Implemented
+    by stateless-law actuator types.
+    """
+    raise NotImplementedError
 
   def __init__(
     self,
@@ -111,8 +213,15 @@ class Actuator(ABC, Generic[ActuatorCfgT]):
     self._target_names = target_names
     self._target_ids: torch.Tensor | None = None
     self._ctrl_ids: torch.Tensor | None = None
+    self._global_ctrl_ids: torch.Tensor | None = None
     self._mjs_actuators: list[mujoco.MjsActuator] = []
     self._site_zeros: torch.Tensor | None = None
+    self._delay_buffer: DelayBuffer | None = None
+
+  @property
+  def has_delay(self) -> bool:
+    """Whether this actuator has delay configured."""
+    return self.cfg.delay_max_lag > 0
 
   @property
   def target_ids(self) -> torch.Tensor:
@@ -132,9 +241,15 @@ class Actuator(ABC, Generic[ActuatorCfgT]):
 
   @property
   def ctrl_ids(self) -> torch.Tensor:
-    """Global indices of control inputs for this actuator."""
+    """Local indices of control inputs within the entity."""
     assert self._ctrl_ids is not None
     return self._ctrl_ids
+
+  @property
+  def global_ctrl_ids(self) -> torch.Tensor:
+    """Global indices of control inputs in the MuJoCo model."""
+    assert self._global_ctrl_ids is not None
+    return self._global_ctrl_ids
 
   @abstractmethod
   def edit_spec(self, spec: mujoco.MjSpec, target_names: list[str]) -> None:
@@ -144,8 +259,10 @@ class Actuator(ABC, Generic[ActuatorCfgT]):
 
     Args:
       spec: The entity's MjSpec to edit.
-      target_names: Names of targets (joints, tendons, or sites) controlled by
-        this actuator.
+      target_names: Names of targets (joints, tendons, or sites) as they
+        appear in the spec. When the entity's ``spec_fn`` uses internal
+        ``MjSpec.attach(prefix=...)``, these will include the prefix
+        (e.g., ``"left/elbow"`` rather than ``"elbow"``).
     """
     raise NotImplementedError
 
@@ -170,14 +287,79 @@ class Actuator(ABC, Generic[ActuatorCfgT]):
     self._target_ids = torch.tensor(
       self._target_ids_list, dtype=torch.long, device=device
     )
-    ctrl_ids_list = [act.id for act in self._mjs_actuators]
-    self._ctrl_ids = torch.tensor(ctrl_ids_list, dtype=torch.long, device=device)
+    global_ctrl_ids_list = [act.id for act in self._mjs_actuators]
+    self._global_ctrl_ids = torch.tensor(
+      global_ctrl_ids_list, dtype=torch.long, device=device
+    )
+    entity_ctrl_ids = self.entity.indexing.ctrl_ids
+    global_to_local = {gid.item(): i for i, gid in enumerate(entity_ctrl_ids)}
+    self._ctrl_ids = torch.tensor(
+      [global_to_local[gid] for gid in global_ctrl_ids_list],
+      dtype=torch.long,
+      device=device,
+    )
 
     # Pre-allocate zeros for SITE transmission type to avoid repeated allocations.
     if self.transmission_type == TransmissionType.SITE:
       nenvs = data.nworld
       ntargets = len(self._target_ids_list)
       self._site_zeros = torch.zeros((nenvs, ntargets), device=device)
+
+    self._init_delay_buffer(data.nworld, device)
+
+  def _init_delay_buffer(self, num_envs: int, device: str) -> None:
+    """Create delay buffer. Called during initialize()."""
+    if not self.has_delay:
+      return
+    self._delay_buffer = DelayBuffer(
+      min_lag=self.cfg.delay_min_lag,
+      max_lag=self.cfg.delay_max_lag,
+      batch_size=num_envs,
+      device=device,
+      hold_prob=self.cfg.delay_hold_prob,
+      update_period=self.cfg.delay_update_period,
+      per_env_phase=self.cfg.delay_per_env_phase,
+    )
+
+  def apply_delay(self, cmd: ActuatorCmd) -> ActuatorCmd:
+    """Delay all command targets with one shared lag. No-op without delay.
+
+    Every target the policy issues (position, velocity, effort) travels the same
+    command channel and experiences the same latency, so they are stacked and
+    delayed together. Feedback fields (``pos``, ``vel``) are never delayed.
+    """
+    if self._delay_buffer is None:
+      return cmd
+    position_target, velocity_target, effort_target = delay_command(
+      self._delay_buffer,
+      cmd.position_target,
+      cmd.velocity_target,
+      cmd.effort_target,
+    )
+    return dataclasses.replace(
+      cmd,
+      position_target=position_target,
+      velocity_target=velocity_target,
+      effort_target=effort_target,
+    )
+
+  def set_lags(
+    self,
+    lags: torch.Tensor,
+    env_ids: torch.Tensor | slice | None = None,
+  ) -> None:
+    """Set delay lag values for specified environments.
+
+    Built-in actuators with the same delay config share a fused delay
+    buffer for performance. Calling ``set_lags`` on any one of them
+    affects the entire fused group.
+
+    Args:
+      lags: Lag values in physics timesteps. Shape: (num_env_ids,) or scalar.
+      env_ids: Environment indices to set. If None, sets all environments.
+    """
+    if self._delay_buffer is not None:
+      self._delay_buffer.set_lags(lags, env_ids)
 
   def get_command(self, data: EntityData) -> ActuatorCmd:
     """Extract command data for this actuator from entity data.
@@ -233,13 +415,14 @@ class Actuator(ABC, Generic[ActuatorCfgT]):
   def reset(self, env_ids: torch.Tensor | slice | None = None) -> None:
     """Reset actuator state for specified environments.
 
-    Base implementation does nothing. Override in subclasses that maintain
-    internal state.
+    Resets delay buffers if present. Subclasses that override this should
+    call ``super().reset(env_ids)``.
 
     Args:
       env_ids: Environment indices to reset. If None, reset all environments.
     """
-    del env_ids  # Unused.
+    if self._delay_buffer is not None:
+      self._delay_buffer.reset(env_ids)
 
   def update(self, dt: float) -> None:
     """Update actuator state after a simulation step.

@@ -22,7 +22,17 @@ from mjlab.managers.curriculum_manager import (
   NullCurriculumManager,
 )
 from mjlab.managers.event_manager import EventManager, EventTermCfg
+from mjlab.managers.metrics_manager import (
+  MetricsManager,
+  MetricsTermCfg,
+  NullMetricsManager,
+)
 from mjlab.managers.observation_manager import ObservationGroupCfg, ObservationManager
+from mjlab.managers.recorder_manager import (
+  NullRecorderManager,
+  RecorderManager,
+  RecorderTermCfg,
+)
 from mjlab.managers.reward_manager import RewardManager, RewardTermCfg
 from mjlab.managers.termination_manager import TerminationManager, TerminationTermCfg
 from mjlab.scene import Scene
@@ -61,7 +71,7 @@ class ManagerBasedRlEnvCfg:
   specifies ``num_envs``, the number of parallel environments."""
 
   observations: dict[str, ObservationGroupCfg] = field(default_factory=dict)
-  """Observation groups configuration. Each group (e.g., "policy", "critic") contains
+  """Observation groups configuration. Each group (e.g., "actor", "critic") contains
   observation terms that are concatenated. Groups can have different settings for
   noise, history, and delay."""
 
@@ -114,6 +124,13 @@ class ManagerBasedRlEnvCfg:
   curriculum: dict[str, CurriculumTermCfg] = field(default_factory=dict)
   """Curriculum terms for adaptive difficulty."""
 
+  metrics: dict[str, MetricsTermCfg] = field(default_factory=dict)
+  """Custom metric terms for logging per-step values as episode averages."""
+
+  recorders: dict[str, RecorderTermCfg] = field(default_factory=dict)
+  """Recorder terms for logging observations, actions, or other data during rollouts.
+  If empty, a no-op manager is used with zero overhead."""
+
   is_finite_horizon: bool = False
   """Whether the task has a finite or infinite horizon. Defaults to False (infinite).
 
@@ -122,6 +139,19 @@ class ManagerBasedRlEnvCfg:
   - **Infinite horizon (False)**: The time limit is an artificial cutoff. The agent
     receives a truncated done signal to bootstrap the value of continuing beyond the
     limit.
+  """
+
+  auto_reset: bool = True
+  """Whether to automatically reset environments that terminate or time out.
+
+  When True (default), ``step()`` resets done environments and returns post-reset
+  observations. When False, ``step()`` returns the true terminal observation and the
+  caller must explicitly call ``reset(env_ids=...)`` for done environments before the
+  next ``step()``.
+
+  Note: mjlab's bundled ``train.py`` goes through rsl_rl's ``OnPolicyRunner``, which
+  does not drive manual resets. ``auto_reset=False`` is intended for users running
+  their own training loop (or a wrapper that handles the reset between steps).
   """
 
   scale_rewards_by_dt: bool = True
@@ -158,13 +188,19 @@ class ManagerBasedRlEnv:
     self._sim_step_counter = 0
     self.extras = {}
     self.obs_buf = {}
+    self._manual_reset_pending = torch.zeros(
+      self.cfg.scene.num_envs, dtype=torch.bool, device=device
+    )
+    # Scratch buffer for per-env command dt; see step().
+    self._command_dt = torch.zeros(self.cfg.scene.num_envs, device=device)
 
     # Initialize scene and simulation.
     self.scene = Scene(self.cfg.scene, device=device)
     self.sim = Simulation(
       num_envs=self.scene.num_envs,
       cfg=self.cfg.sim,
-      model=self.scene.compile(),
+      spec=self.scene.spec,
+      variant_info=self.scene.collect_variant_info(),
       device=device,
     )
 
@@ -173,6 +209,10 @@ class ManagerBasedRlEnv:
       model=self.sim.model,
       data=self.sim.data,
     )
+
+    # Wire sensor context to simulation for sense_graph.
+    if self.scene.sensor_context is not None:
+      self.sim.set_sensor_context(self.scene.sensor_context)
 
     # Print environment info.
     print_info("")
@@ -198,11 +238,15 @@ class ManagerBasedRlEnv:
     self._offline_renderer: OffscreenRenderer | None = None
     if self.render_mode == "rgb_array":
       renderer = OffscreenRenderer(
-        model=self.sim.mj_model, cfg=self.cfg.viewer, scene=self.scene
+        model=self.sim.mj_model,
+        cfg=self.cfg.viewer,
+        scene=self.scene,
+        sim_model=self.sim.model,
+        expanded_fields=self.sim.expanded_fields,
       )
       renderer.initialize()
       self._offline_renderer = renderer
-    self.metadata["render_fps"] = 1.0 / self.step_dt  # type: ignore
+    self.metadata["render_fps"] = 1.0 / self.step_dt
 
     # Load all managers.
     self.load_managers()
@@ -251,6 +295,8 @@ class ManagerBasedRlEnv:
     self.manager_visualizers = {}
     if getattr(self.command_manager, "active_terms", None):
       self.manager_visualizers["command_manager"] = self.command_manager
+    self.manager_visualizers["event_manager"] = self.event_manager
+    self.manager_visualizers["reward_manager"] = self.reward_manager
 
   def load_managers(self) -> None:
     """Load and initialize all managers.
@@ -291,6 +337,16 @@ class ManagerBasedRlEnv:
     else:
       self.curriculum_manager = NullCurriculumManager()
     print_info(f"[INFO] {self.curriculum_manager}")
+    if len(self.cfg.metrics) > 0:
+      self.metrics_manager = MetricsManager(self.cfg.metrics, self)
+    else:
+      self.metrics_manager = NullMetricsManager()
+    print_info(f"[INFO] {self.metrics_manager}")
+    if len(self.cfg.recorders) > 0:
+      self.recorder_manager = RecorderManager(self.cfg.recorders, self)
+    else:
+      self.recorder_manager = NullRecorderManager()
+    print_info(f"[INFO] {self.recorder_manager}")
 
     # Configure spaces for the environment.
     self._configure_gym_env_spaces()
@@ -311,13 +367,71 @@ class ManagerBasedRlEnv:
       env_ids = torch.arange(self.num_envs, dtype=torch.int64, device=self.device)
     if seed is not None:
       self.seed(seed)
+    self.extras["log"] = dict()
     self._reset_idx(env_ids)
     self.scene.write_data_to_sim()
     self.sim.forward()
-    self.obs_buf = self.observation_manager.compute(update_history=True)
+    # Scoped to env_ids so a partial reset does not advance stateful commands in the
+    # other envs.
+    self.command_manager.compute(dt=0.0, env_ids=env_ids)
+    self.sim.sense()
+    # Scoped to env_ids: only the reset envs' history/delay buffers receive
+    # the post-reset frame; other envs' observation timelines are untouched.
+    self.obs_buf = self.observation_manager.compute(
+      update_history=True, env_ids=env_ids
+    )
+    self.recorder_manager.record_post_reset(env_ids)
     return self.obs_buf, self.extras
 
   def step(self, action: torch.Tensor) -> types.VecEnvStepReturn:
+    """Run one environment step: apply actions, simulate, compute RL signals.
+
+    When ``auto_reset=True`` (default), environments that terminate or time out are
+    reset in place and the returned observation is the post-reset state. When
+    ``auto_reset=False``, the reset is skipped and the returned observation is the
+    terminal state; the caller must call ``reset(env_ids=...)`` for done envs before
+    the next ``step()``.
+
+    **Forward-call placement.** MuJoCo's ``mj_step`` runs forward kinematics *before*
+    integration, so after stepping, derived quantities (``xpos``, ``xquat``,
+    ``site_xpos``, ``cvel``, ``sensordata``) lag ``qpos``/``qvel`` by one physics
+    substep. Rather than calling ``sim.forward()`` twice (once after the decimation
+    loop and once after the reset block), this method calls it **once**, right
+    before observation computation. This single call refreshes derived quantities
+    for *all* envs: non-reset envs pick up post-decimation kinematics, reset envs
+    pick up post-reset kinematics.
+
+    The tradeoff is that termination, reward, and step/interval event managers see
+    derived quantities that are stale by one physics substep (the last ``mj_step``
+    ran ``mj_forward`` from *pre*-integration ``qpos``). In practice, the staleness
+    is negligible for reward shaping, termination checks, and event perturbations.
+    Critically, the staleness is *consistent*: every env, every step, always sees
+    the same lag, so the MDP is well-defined and the value function can learn the
+    correct mapping.
+
+    **Auto-reset parity.** Auto-reset reproduces the explicit ``reset()`` flow:
+    events fire on the terminal state before the reset, and freshly reset envs
+    advance commands with ``dt=0`` so their timers start full.
+
+    .. note::
+
+      Events and reset-path resamples all run *before* ``forward()``, so state
+      they write (e.g. a velocity push) is refreshed automatically and visible
+      in this step's observations. Command updates run *after*
+      the call, so a command that writes sim state must refresh derived
+      quantities itself (see ``MotionCommand._update_command``). In all cases,
+      do not read derived quantities (``root_link_pose_w``, ``body_link_vel_w``,
+      etc.) in the same function that writes state (``write_root_state_to_sim``,
+      ``write_joint_state_to_sim``, etc.). See :ref:`faq` for details.
+    """
+    if not self.cfg.auto_reset and torch.any(self._manual_reset_pending):
+      pending_ids = self._manual_reset_pending.nonzero(as_tuple=False).squeeze(-1)
+      raise RuntimeError(
+        f"Environments {pending_ids.cpu().tolist()} must be reset via "
+        "reset(env_ids=...) before calling step() again when auto_reset=False."
+      )
+
+    self.extras["log"] = dict()
     self.action_manager.process_action(action.to(self.device))
 
     for _ in range(self.cfg.decimation):
@@ -326,31 +440,62 @@ class ManagerBasedRlEnv:
       self.scene.write_data_to_sim()
       self.sim.step()
       self.scene.update(dt=self.physics_dt)
+      self.metrics_manager.compute_substep()
 
     # Update env counters.
     self.episode_length_buf += 1
     self.common_step_counter += 1
 
-    # Check terminations.
+    # Check terminations and compute rewards.
+    # NOTE: Derived quantities (xpos, xquat, ...) are stale by one physics
+    # substep here. See the docstring above for why this is acceptable.
     self.reset_buf = self.termination_manager.compute()
     self.reset_terminated = self.termination_manager.terminated
     self.reset_time_outs = self.termination_manager.time_outs
 
     self.reward_buf = self.reward_manager.compute(dt=self.step_dt)
+    self.metrics_manager.compute()
 
-    # Reset envs that terminated/timed-out and log the episode info.
-    reset_env_ids = self.reset_buf.nonzero(as_tuple=False).squeeze(-1)
-    if len(reset_env_ids) > 0:
-      self._reset_idx(reset_env_ids)
-      self.scene.write_data_to_sim()
-      self.sim.forward()
-
-    self.command_manager.compute(dt=self.step_dt)
-
+    # Events fire before auto-reset, on the terminal state, matching the
+    # explicit flow. Staleness and forward() rules are the same as for
+    # termination/reward (see docstring above).
+    if "step" in self.event_manager.available_modes:
+      self.event_manager.apply(mode="step", dt=self.step_dt)
     if "interval" in self.event_manager.available_modes:
       self.event_manager.apply(mode="interval", dt=self.step_dt)
 
+    # Reset envs that terminated/timed-out and log the episode info.
+    reset_env_ids = self.reset_buf.nonzero(as_tuple=False).squeeze(-1)
+    if self.cfg.auto_reset and len(reset_env_ids) > 0:
+      self.recorder_manager.record_pre_reset(reset_env_ids)
+      self._reset_idx(reset_env_ids)
+      self.scene.write_data_to_sim()
+
+    # Single forward() call: recompute derived quantities from current
+    # qpos/qvel for every env. For non-reset envs this resolves the
+    # one-substep staleness left by mj_step; for reset envs it picks up
+    # the freshly written reset state.
+    self.sim.forward()
+
+    # Pass dt=0 for freshly reset envs so their command timers start full,
+    # matching reset().
+    if self.cfg.auto_reset and len(reset_env_ids) > 0:
+      command_dt = self._command_dt
+      command_dt.fill_(self.step_dt)
+      command_dt[reset_env_ids] = 0.0
+      self.command_manager.compute(dt=command_dt)
+    else:
+      self.command_manager.compute(dt=self.step_dt)
+
+    self.sim.sense()
     self.obs_buf = self.observation_manager.compute(update_history=True)
+
+    if self.cfg.auto_reset and len(reset_env_ids) > 0:
+      self.recorder_manager.record_post_reset(reset_env_ids)
+    elif len(reset_env_ids) > 0:
+      self._manual_reset_pending[reset_env_ids] = True
+
+    self.recorder_manager.record_post_step()
 
     return (
       self.obs_buf,
@@ -359,6 +504,9 @@ class ManagerBasedRlEnv:
       self.reset_time_outs,
       self.extras,
     )
+
+  def get_observations(self) -> dict:
+    return self.observation_manager.compute()
 
   def render(self) -> np.ndarray | None:
     if self.render_mode == "human" or self.render_mode is None:
@@ -380,6 +528,7 @@ class ManagerBasedRlEnv:
   def close(self) -> None:
     if self._offline_renderer is not None:
       self._offline_renderer.close()
+    self.recorder_manager.close()
 
   @staticmethod
   def seed(seed: int = -1) -> int:
@@ -440,7 +589,6 @@ class ManagerBasedRlEnv:
       )
 
     # NOTE: This is order sensitive.
-    self.extras["log"] = dict()
     # observation manager.
     info = self.observation_manager.reset(env_ids)
     self.extras["log"].update(info)
@@ -449,6 +597,9 @@ class ManagerBasedRlEnv:
     self.extras["log"].update(info)
     # rewards manager.
     info = self.reward_manager.reset(env_ids)
+    self.extras["log"].update(info)
+    # metrics manager.
+    info = self.metrics_manager.reset(env_ids)
     self.extras["log"].update(info)
     # curriculum manager.
     info = self.curriculum_manager.reset(env_ids)
@@ -464,3 +615,4 @@ class ManagerBasedRlEnv:
     self.extras["log"].update(info)
     # reset the episode length buffer.
     self.episode_length_buf[env_ids] = 0
+    self._manual_reset_pending[env_ids] = False

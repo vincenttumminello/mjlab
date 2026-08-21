@@ -24,6 +24,11 @@ class SensorCfg(ABC):
 
   name: str
 
+  @property
+  def prefixed_name(self) -> str:
+    """The sensor name as it appears in the MuJoCo model."""
+    return self.name
+
   @abstractmethod
   def build(self) -> Sensor[Any]:
     """Build sensor instance from this config."""
@@ -41,6 +46,9 @@ class Sensor(ABC, Generic[T]):
   - Call `super().__init__()` in their `__init__` method
   - If overriding `reset()` or `update()`, call `super()` FIRST to invalidate cache
   """
+
+  requires_sensor_context: bool = False
+  """Whether this sensor needs a SensorContext (render context)."""
 
   def __init__(self) -> None:
     self._cached_data: T | None = None

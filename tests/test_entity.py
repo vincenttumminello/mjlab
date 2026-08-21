@@ -8,10 +8,11 @@ import pytest
 import torch
 from conftest import get_test_device, load_fixture_xml
 
-from mjlab.actuator import BuiltinPositionActuatorCfg, XmlMotorActuatorCfg
+from mjlab.actuator import BuiltinPositionActuatorCfg, XmlActuatorCfg
 from mjlab.entity import Entity, EntityArticulationInfoCfg, EntityCfg
 from mjlab.scene import Scene, SceneCfg
 from mjlab.sim.sim import Simulation, SimulationCfg
+from mjlab.utils.spec_config import CollisionCfg, GeomCfg
 
 FIXED_BASE_XML = """
 <mujoco>
@@ -224,6 +225,72 @@ def test_entity_properties(entity_fn, expected):
   entity = entity_fn()
   for prop, value in expected.items():
     assert getattr(entity, prop) == value
+
+
+def test_unnamed_freejoint_gets_default_name():
+  """Test that an unnamed freejoint is auto-named during entity init."""
+  xml = """
+  <mujoco>
+    <worldbody>
+      <body name="object" pos="0 0 1">
+        <freejoint/>
+        <geom name="object_geom" type="box" size="0.1 0.1 0.1" mass="0.1"/>
+      </body>
+    </worldbody>
+  </mujoco>
+  """
+  cfg = EntityCfg(spec_fn=lambda: mujoco.MjSpec.from_string(xml))
+  entity = Entity(cfg)
+  assert "floating_base_joint" in entity.all_joint_names
+
+
+def test_multiple_freejoints_raises():
+  """An entity with more than one freejoint is rejected at construction."""
+  xml = """
+  <mujoco>
+    <worldbody>
+      <body name="object_a" pos="0 0 1">
+        <freejoint/>
+        <geom type="box" size="0.1 0.1 0.1" mass="0.1"/>
+      </body>
+      <body name="object_b" pos="1 0 1">
+        <freejoint/>
+        <geom type="box" size="0.1 0.1 0.1" mass="0.1"/>
+      </body>
+    </worldbody>
+  </mujoco>
+  """
+  cfg = EntityCfg(spec_fn=lambda: mujoco.MjSpec.from_string(xml))
+  with pytest.raises(ValueError, match="2 freejoints"):
+    Entity(cfg)
+
+
+def test_geom_editor_applied():
+  """Test that geom editors are applied during entity init."""
+  cfg = EntityCfg(
+    spec_fn=lambda: mujoco.MjSpec.from_string(FIXED_BASE_ARTICULATED_XML),
+    geoms=(GeomCfg(geom_names_expr=("link.*_geom",), group=3),),
+  )
+  entity = Entity(cfg)
+
+  assert entity.spec.geom("link1_geom").group == 3
+  assert entity.spec.geom("link2_geom").group == 3
+  assert entity.spec.geom("base_geom").group == 0
+
+
+def test_geom_collision_overlap_warns():
+  """A GeomCfg collision patch clobbered by a CollisionCfg triggers a warning."""
+  cfg = EntityCfg(
+    spec_fn=lambda: mujoco.MjSpec.from_string(FIXED_BASE_ARTICULATED_XML),
+    geoms=(GeomCfg(geom_names_expr=("link1_geom",), condim=6),),
+    collisions=(
+      CollisionCfg(
+        geom_names_expr=("link.*_geom",), contype=1, conaffinity=1, condim=3, priority=0
+      ),
+    ),
+  )
+  with pytest.warns(UserWarning, match="link1_geom.condim"):
+    Entity(cfg)
 
 
 def test_find_methods():
@@ -462,7 +529,7 @@ def test_find_joints_by_actuator_names_preserves_natural_order(device):
   robot_cfg = EntityCfg(
     spec_fn=lambda: mujoco.MjSpec.from_string(ACTUATOR_ORDER_TEST_XML),
     articulation=EntityArticulationInfoCfg(
-      actuators=(XmlMotorActuatorCfg(target_names_expr=(".*",)),)
+      actuators=(XmlActuatorCfg(target_names_expr=(".*",)),)
     ),
   )
 
@@ -493,7 +560,7 @@ def test_ctrl_ids_follow_natural_joint_order(device):
   robot_cfg = EntityCfg(
     spec_fn=lambda: mujoco.MjSpec.from_string(ACTUATOR_ORDER_TEST_XML),
     articulation=EntityArticulationInfoCfg(
-      actuators=(XmlMotorActuatorCfg(target_names_expr=(".*",)),)
+      actuators=(XmlActuatorCfg(target_names_expr=(".*",)),)
     ),
   )
 
@@ -533,7 +600,7 @@ def test_find_joints_by_actuator_names_returns_entity_local_indices():
   robot_cfg = EntityCfg(
     spec_fn=lambda: mujoco.MjSpec.from_string(UNDERACTUATED_XML),
     articulation=EntityArticulationInfoCfg(
-      actuators=(XmlMotorActuatorCfg(target_names_expr=(".*",)),)
+      actuators=(XmlActuatorCfg(target_names_expr=(".*",)),)
     ),
   )
 
@@ -747,3 +814,57 @@ def test_tendon_and_site_targets_only_allocated_when_needed(device):
 
   # Joint targets should still be allocated (2 joints).
   assert entity.data.joint_pos_target.shape == (4, 2)
+
+
+def test_add_actuators_wrong_namespace_error_includes_hint():
+  """Error message includes namespace hint when name exists in another namespace."""
+  from mjlab.actuator.actuator import TransmissionType
+
+  cfg = EntityCfg(
+    spec_fn=lambda: mujoco.MjSpec.from_string(XML_WITH_SITES_AND_TENDONS),
+    articulation=EntityArticulationInfoCfg(
+      actuators=(
+        BuiltinPositionActuatorCfg(
+          target_names_expr=("tendon1",),
+          stiffness=10.0,
+          damping=1.0,
+          transmission_type=TransmissionType.JOINT,
+        ),
+      )
+    ),
+  )
+  with pytest.raises(ValueError, match="Matches were found in.*tendons.*tendon1"):
+    Entity(cfg)
+
+
+@pytest.mark.filterwarnings("ignore:Actuator config matched")
+def test_wildcard_warns_about_unactuated_namespaces():
+  """Wildcard matching joints should warn about unactuated tendons."""
+  cfg = EntityCfg(
+    spec_fn=lambda: mujoco.MjSpec.from_string(XML_WITH_SITES_AND_TENDONS),
+    articulation=EntityArticulationInfoCfg(
+      actuators=(
+        BuiltinPositionActuatorCfg(
+          target_names_expr=(".*",),
+          stiffness=10.0,
+          damping=1.0,
+        ),
+      )
+    ),
+  )
+  with pytest.warns(match="also match.*tendon"):
+    Entity(cfg)
+
+
+def test_set_joint_position_target_outer_product(device):
+  """Tensor env_ids + tensor joint_ids select the outer product, not a diagonal."""
+  entity = create_fixed_articulated_entity()
+  entity, _ = initialize_entity_with_sim(entity, device, num_envs=2)
+
+  targets = torch.tensor([[1.0, 2.0], [3.0, 4.0]], device=device)
+  entity.set_joint_position_target(
+    targets,
+    joint_ids=torch.tensor([0, 1], device=device),
+    env_ids=torch.tensor([0, 1], device=device),
+  )
+  assert torch.equal(entity.data.joint_pos_target, targets)

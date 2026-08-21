@@ -25,7 +25,7 @@ def expand_model_fields(
   if nworld == 1:
     return
 
-  def tile(x: wp.array) -> wp.array:
+  def tile(x: wp.array) -> wp.array | wp.array2d | wp.array3d | wp.array4d:
     # Create new array with same shape but first dim multiplied by nworld.
     new_shape = list(x.shape)
     new_shape[0] = nworld
@@ -35,7 +35,7 @@ def expand_model_fields(
     dst = wp_array(shape=new_shape, dtype=x.dtype, device=x.device)
 
     src_flat = x.flatten()
-    dst_flat = dst.flatten()
+    dst_flat = dst.flatten()  # type: ignore[possibly-missing-attribute]
 
     # Launch kernel to repeat data, one thread per destination element.
     n_elems_per_world = dst_flat.shape[0] // nworld
@@ -51,4 +51,6 @@ def expand_model_fields(
   for field in model.__dataclass_fields__:
     if field in fields_to_expand:
       array = getattr(model, field)
+      if array.shape[0] != 1:
+        continue  # Already per-world (e.g., variant compilation).
       setattr(model, field, tile(array))

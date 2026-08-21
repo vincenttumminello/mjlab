@@ -1,10 +1,36 @@
 import os
+import sys
+
+# Default to EGL for GPU-accelerated offscreen rendering on Linux. Must be set
+# before any mujoco import: mujoco's gl_context module captures MUJOCO_GL once
+# at load time. Override with e.g. MUJOCO_GL=osmesa on clusters without EGL.
+# Linux-only because mujoco's gl_context rejects "egl" on macOS/Windows and
+# raises at import. On those platforms we leave MUJOCO_GL alone so mujoco
+# defaults to GLFW.
+if sys.platform.startswith("linux"):
+  os.environ.setdefault("MUJOCO_GL", "egl")
+
+import traceback
 from importlib.metadata import entry_points
 from pathlib import Path
 
+import tyro
 import warp as wp
 
 MJLAB_SRC_PATH: Path = Path(__file__).parent
+
+TYRO_FLAGS = (
+  # Don't let users switch between types in unions. This produces a simpler CLI
+  # with flatter helptext, at the cost of some flexibility. Type changes can
+  # just be done in code.
+  tyro.conf.AvoidSubcommands,
+  # Disable automatic flag conversion (e.g., use `--flag False` instead of
+  # `--no-flag` for booleans).
+  tyro.conf.FlagConversionOff,
+  # Use Python syntax for collections: --tuple (1,2,3) instead of --tuple 1 2 3.
+  # Helps with wandb sweep compatibility: https://brentyi.github.io/tyro/wandb_sweeps/
+  tyro.conf.UsePythonSyntaxForLiteralCollections,
+)
 
 
 def _configure_warp() -> None:
@@ -28,9 +54,22 @@ def _import_registered_packages() -> None:
   for entry_point in mjlab_tasks:
     try:
       entry_point.load()
-    except Exception as e:
-      print(f"[WARN] Failed to load task package {entry_point.name}: {e}")
+    except Exception:
+      print(
+        f"[WARN] Failed to load task package '{entry_point.name}' ({entry_point.value}):",
+        file=sys.stderr,
+      )
+      traceback.print_exc(file=sys.stderr)
+
+
+def _configure_mediapy() -> None:
+  """Point mediapy at the bundled imageio-ffmpeg binary."""
+  import imageio_ffmpeg
+  import mediapy
+
+  mediapy.set_ffmpeg(imageio_ffmpeg.get_ffmpeg_exe())
 
 
 _configure_warp()
+_configure_mediapy()
 _import_registered_packages()

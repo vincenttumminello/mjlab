@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import mujoco
 import numpy as np
-import torch
 from typing_extensions import override
 
 from mjlab.viewer.debug_visualizer import DebugVisualizer
@@ -32,17 +31,22 @@ class MujocoNativeDebugVisualizer(DebugVisualizer):
       env_idx: Index of the environment being visualized
       show_all_envs: If True, visualize all environments instead of just env_idx
     """
-    self.scn = scn
-    self.mj_model = mj_model
+    # DebugVisualizer interface.
     self.env_idx = env_idx
     self.show_all_envs = show_all_envs
+
+    self._mjv_scene = scn
     self._initial_geom_count = scn.ngeom
     self._meansize: float = mj_model.stat.meansize
 
+    # State used only by the ghost visualization. The model is a shared
+    # reference and must not be modified; ghost transparency is controlled
+    # through the mjVIS_TRANSPARENT flag rather than per-geom alpha.
+    self._ref_mj_model = mj_model
+    self._mj_data = mujoco.MjData(mj_model)
     self._vopt = mujoco.MjvOption()
     self._vopt.flags[mujoco.mjtVisFlag.mjVIS_TRANSPARENT] = True
     self._pert = mujoco.MjvPerturb()
-    self._viz_data = mujoco.MjData(mj_model)
 
   @property
   @override
@@ -52,8 +56,8 @@ class MujocoNativeDebugVisualizer(DebugVisualizer):
   @override
   def add_arrow(
     self,
-    start: np.ndarray | torch.Tensor,
-    end: np.ndarray | torch.Tensor,
+    start: np.ndarray,
+    end: np.ndarray,
     color: tuple[float, float, float, float],
     width: float = 0.015,
     label: str | None = None,
@@ -61,13 +65,8 @@ class MujocoNativeDebugVisualizer(DebugVisualizer):
     """Add an arrow visualization using MuJoCo's arrow geometry."""
     del label  # Unused.
 
-    if isinstance(start, torch.Tensor):
-      start = start.cpu().numpy()
-    if isinstance(end, torch.Tensor):
-      end = end.cpu().numpy()
-
-    self.scn.ngeom += 1
-    geom = self.scn.geoms[self.scn.ngeom - 1]
+    self._mjv_scene.ngeom += 1
+    geom = self._mjv_scene.geoms[self._mjv_scene.ngeom - 1]
     geom.category = mujoco.mjtCatBit.mjCAT_DECOR
 
     mujoco.mjv_initGeom(
@@ -89,8 +88,10 @@ class MujocoNativeDebugVisualizer(DebugVisualizer):
   @override
   def add_ghost_mesh(
     self,
-    qpos: np.ndarray | torch.Tensor,
+    qpos: np.ndarray,
     model: mujoco.MjModel,
+    mocap_pos: np.ndarray | None = None,
+    mocap_quat: np.ndarray | None = None,
     alpha: float = 0.5,
     label: str | None = None,
   ) -> None:
@@ -100,58 +101,53 @@ class MujocoNativeDebugVisualizer(DebugVisualizer):
 
     Args:
       qpos: Joint positions for the ghost pose
-      model: MuJoCo model with pre-configured appearance (geom_rgba for colors)
+      model: MuJoCo model with pre-configured appearance (geom_rgba for colors).
+        Must be structurally identical to the model this visualizer was
+        created with, since it is evaluated against the internal MjData.
+      mocap_pos: Optional mocap position(s) for fixed-base entities
+      mocap_quat: Optional mocap quaternion(s) for fixed-base entities
       alpha: Transparency override (not used in MuJoCo implementation)
       label: Optional label (not used in MuJoCo implementation)
     """
     del alpha, label  # Unused.
 
-    if isinstance(qpos, torch.Tensor):
-      qpos = qpos.cpu().numpy()
-
-    self._viz_data.qpos[:] = qpos
-    mujoco.mj_forward(model, self._viz_data)
+    self._mj_data.qpos[:] = qpos
+    if mocap_pos is not None and model.nmocap > 0:
+      mocap_pos_arr = np.asarray(mocap_pos)
+      if mocap_pos_arr.ndim == 1:
+        self._mj_data.mocap_pos[0] = mocap_pos_arr
+      else:
+        self._mj_data.mocap_pos[:] = mocap_pos_arr
+    if mocap_quat is not None and model.nmocap > 0:
+      mocap_quat_arr = np.asarray(mocap_quat)
+      if mocap_quat_arr.ndim == 1:
+        self._mj_data.mocap_quat[0] = mocap_quat_arr
+      else:
+        self._mj_data.mocap_quat[:] = mocap_quat_arr
+    mujoco.mj_forward(model, self._mj_data)
 
     mujoco.mjv_addGeoms(
       model,
-      self._viz_data,
+      self._mj_data,
       self._vopt,
       self._pert,
       mujoco.mjtCatBit.mjCAT_DYNAMIC.value,
-      self.scn,
+      self._mjv_scene,
     )
 
   @override
   def add_frame(
     self,
-    position: np.ndarray | torch.Tensor,
-    rotation_matrix: np.ndarray | torch.Tensor,
+    position: np.ndarray,
+    rotation_matrix: np.ndarray,
     scale: float = 0.3,
     label: str | None = None,
     axis_radius: float = 0.01,
     alpha: float = 1.0,
     axis_colors: tuple[tuple[float, float, float], ...] | None = None,
   ) -> None:
-    """Add a coordinate frame visualization with RGB-colored axes.
-
-    This implementation reuses add_arrow to draw the three axis arrows.
-
-    Args:
-      position: Position of the frame origin (3D vector)
-      rotation_matrix: Rotation matrix (3x3)
-      scale: Scale/length of the axis arrows
-      label: Optional label for this frame.
-      axis_radius: Radius of the axis arrows.
-      alpha: Opacity for all axes (0=transparent, 1=opaque).
-      axis_colors: Optional tuple of 3 RGB colors for X, Y, Z axes. If None, uses
-        default RGB coloring (X=red, Y=green, Z=blue).
-    """
+    """Add a coordinate frame visualization with RGB-colored axes."""
     del label  # Unused.
-
-    if isinstance(position, torch.Tensor):
-      position = position.cpu().numpy()
-    if isinstance(rotation_matrix, torch.Tensor):
-      rotation_matrix = rotation_matrix.cpu().numpy()
 
     default_colors = [(0.9, 0, 0), (0, 0.9, 0.0), (0.0, 0.0, 0.9)]
     colors = axis_colors if axis_colors is not None else default_colors
@@ -171,7 +167,7 @@ class MujocoNativeDebugVisualizer(DebugVisualizer):
   @override
   def add_sphere(
     self,
-    center: np.ndarray | torch.Tensor,
+    center: np.ndarray,
     radius: float,
     color: tuple[float, float, float, float],
     label: str | None = None,
@@ -179,11 +175,8 @@ class MujocoNativeDebugVisualizer(DebugVisualizer):
     """Add a sphere visualization using MuJoCo's sphere geometry."""
     del label  # Unused.
 
-    if isinstance(center, torch.Tensor):
-      center = center.cpu().numpy()
-
-    self.scn.ngeom += 1
-    geom = self.scn.geoms[self.scn.ngeom - 1]
+    self._mjv_scene.ngeom += 1
+    geom = self._mjv_scene.geoms[self._mjv_scene.ngeom - 1]
     geom.category = mujoco.mjtCatBit.mjCAT_DECOR
 
     mujoco.mjv_initGeom(
@@ -198,8 +191,8 @@ class MujocoNativeDebugVisualizer(DebugVisualizer):
   @override
   def add_cylinder(
     self,
-    start: np.ndarray | torch.Tensor,
-    end: np.ndarray | torch.Tensor,
+    start: np.ndarray,
+    end: np.ndarray,
     radius: float,
     color: tuple[float, float, float, float],
     label: str | None = None,
@@ -207,13 +200,8 @@ class MujocoNativeDebugVisualizer(DebugVisualizer):
     """Add a cylinder visualization using MuJoCo's cylinder connector."""
     del label  # Unused.
 
-    if isinstance(start, torch.Tensor):
-      start = start.cpu().numpy()
-    if isinstance(end, torch.Tensor):
-      end = end.cpu().numpy()
-
-    self.scn.ngeom += 1
-    geom = self.scn.geoms[self.scn.ngeom - 1]
+    self._mjv_scene.ngeom += 1
+    geom = self._mjv_scene.geoms[self._mjv_scene.ngeom - 1]
     geom.category = mujoco.mjtCatBit.mjCAT_DECOR
 
     mujoco.mjv_initGeom(
@@ -233,6 +221,56 @@ class MujocoNativeDebugVisualizer(DebugVisualizer):
     )
 
   @override
+  def add_ellipsoid(
+    self,
+    center: np.ndarray,
+    size: np.ndarray,
+    mat: np.ndarray,
+    color: tuple[float, float, float, float],
+    label: str | None = None,
+  ) -> None:
+    """Add an ellipsoid visualization using MuJoCo's ellipsoid geometry."""
+    del label  # Unused.
+
+    self._mjv_scene.ngeom += 1
+    geom = self._mjv_scene.geoms[self._mjv_scene.ngeom - 1]
+    geom.category = mujoco.mjtCatBit.mjCAT_DECOR
+
+    mujoco.mjv_initGeom(
+      geom=geom,
+      type=mujoco.mjtGeom.mjGEOM_ELLIPSOID.value,
+      size=np.asarray(size, dtype=np.float64),
+      pos=np.asarray(center, dtype=np.float64),
+      mat=np.asarray(mat, dtype=np.float64).flatten(),
+      rgba=np.asarray(color, dtype=np.float32),
+    )
+
+  @override
+  def add_box(
+    self,
+    center: np.ndarray,
+    size: np.ndarray,
+    mat: np.ndarray,
+    color: tuple[float, float, float, float],
+    label: str | None = None,
+  ) -> None:
+    """Add a box visualization using MuJoCo's box geometry."""
+    del label  # Unused.
+
+    self._mjv_scene.ngeom += 1
+    geom = self._mjv_scene.geoms[self._mjv_scene.ngeom - 1]
+    geom.category = mujoco.mjtCatBit.mjCAT_DECOR
+
+    mujoco.mjv_initGeom(
+      geom=geom,
+      type=mujoco.mjtGeom.mjGEOM_BOX.value,
+      size=np.asarray(size, dtype=np.float64),
+      pos=np.asarray(center, dtype=np.float64),
+      mat=np.asarray(mat, dtype=np.float64).flatten(),
+      rgba=np.asarray(color, dtype=np.float32),
+    )
+
+  @override
   def clear(self) -> None:
     """Clear debug visualizations by resetting geom count."""
-    self.scn.ngeom = self._initial_geom_count
+    self._mjv_scene.ngeom = self._initial_geom_count

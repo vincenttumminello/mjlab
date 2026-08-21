@@ -62,7 +62,7 @@ class ObservationTermCfg(ManagerTermBaseCfg):
 
   When True and concatenate_terms=True, uses term-major ordering:
   [A_t0, A_t1, ..., A_tH-1, B_t0, B_t1, ..., B_tH-1, ...]
-  See docs/api/observation_history_delay.md for details on ordering."""
+  See docs/source/observation.rst for details on ordering."""
 
 
 @dataclass
@@ -70,7 +70,7 @@ class ObservationGroupCfg:
   """Configuration for an observation group.
 
   An observation group bundles multiple observation terms together. Groups are
-  typically used to separate observations for different purposes (e.g., "policy"
+  typically used to separate observations for different purposes (e.g., "actor"
   for the actor, "critic" for the value function).
   """
 
@@ -253,8 +253,9 @@ class ObservationManager(ManagerBase):
           self._group_obs_term_history_buffer[group_name][term_name].reset(
             batch_ids=batch_ids
           )
-    for mod in self._group_obs_class_instances.values():
-      mod.reset(env_ids=env_ids)
+    for group_mods in self._group_obs_class_instances.values():
+      for mod in group_mods.values():
+        mod.reset(env_ids=env_ids)
     return {}
 
   def _check_and_handle_nans(
@@ -264,7 +265,7 @@ class ObservationManager(ManagerBase):
 
     Args:
       tensor: Observation tensor to check.
-      context: Context string for error/warning messages (e.g., "policy/base_lin_vel").
+      context: Context string for error/warning messages (e.g., "actor/base_lin_vel").
       policy: NaN handling policy ("disabled", "warn", "sanitize", "error").
 
     Returns:
@@ -302,8 +303,21 @@ class ObservationManager(ManagerBase):
     return torch.nan_to_num(tensor, nan=0.0, posinf=0.0, neginf=0.0)
 
   def compute(
-    self, update_history: bool = False
+    self,
+    update_history: bool = False,
+    env_ids: torch.Tensor | None = None,
   ) -> dict[str, torch.Tensor | dict[str, torch.Tensor]]:
+    """Compute observations for all groups.
+
+    With env_ids=None (the per-step path), history and delay buffers advance
+    for all envs. With env_ids (the reset path), only the reset envs' buffers
+    receive their post-reset frame (a backfill); other envs' buffers, delay
+    schedules, and lag draws are untouched, so a partial reset does not
+    advance their observation timelines.
+    """
+    assert env_ids is None or update_history, (
+      "env_ids is only meaningful with update_history=True (the reset path)."
+    )
     # Return cached observations if not updating and cache exists.
     # This prevents double-pushing to delay buffers when compute() is called
     # multiple times per control step (e.g., in get_observations() after step()).
@@ -312,12 +326,15 @@ class ObservationManager(ManagerBase):
 
     obs_buffer: dict[str, torch.Tensor | dict[str, torch.Tensor]] = dict()
     for group_name in self._group_obs_term_names:
-      obs_buffer[group_name] = self.compute_group(group_name, update_history)
+      obs_buffer[group_name] = self.compute_group(group_name, update_history, env_ids)
     self._obs_buffer = obs_buffer
     return obs_buffer
 
   def compute_group(
-    self, group_name: str, update_history: bool = False
+    self,
+    group_name: str,
+    update_history: bool = False,
+    env_ids: torch.Tensor | None = None,
   ) -> torch.Tensor | dict[str, torch.Tensor]:
     group_cfg = self.cfg[group_name]
     group_term_names = self._group_obs_term_names[group_name]
@@ -330,7 +347,7 @@ class ObservationManager(ManagerBase):
       if isinstance(term_cfg.noise, noise_cfg.NoiseCfg):
         obs = term_cfg.noise.apply(obs)
       elif isinstance(term_cfg.noise, noise_cfg.NoiseModelCfg):
-        obs = self._group_obs_class_instances[term_name](obs)
+        obs = self._group_obs_class_instances[group_name][term_name](obs)
       if term_cfg.clip:
         obs = obs.clip_(min=term_cfg.clip[0], max=term_cfg.clip[1])
       if term_cfg.scale is not None:
@@ -346,12 +363,19 @@ class ObservationManager(ManagerBase):
 
       if term_cfg.delay_max_lag > 0:
         delay_buffer = self._group_obs_term_delay_buffer[group_name][term_name]
-        delay_buffer.append(obs)
-        obs = delay_buffer.compute()
+        if env_ids is None or not delay_buffer.is_initialized:
+          delay_buffer.append(obs)
+          obs = delay_buffer.compute()
+        else:
+          delay_buffer.backfill(obs, env_ids)
+          obs = delay_buffer.peek()
       if term_cfg.history_length > 0:
         circular_buffer = self._group_obs_term_history_buffer[group_name][term_name]
-        if update_history or not circular_buffer.is_initialized:
-          circular_buffer.append(obs)
+        if env_ids is None or not circular_buffer.is_initialized:
+          if update_history or not circular_buffer.is_initialized:
+            circular_buffer.append(obs)
+        else:
+          circular_buffer.backfill(obs, env_ids)
 
         if term_cfg.flatten_history_dim:
           group_obs[term_name] = circular_buffer.buffer.reshape(self._env.num_envs, -1)
@@ -392,7 +416,7 @@ class ObservationManager(ManagerBase):
     self._group_obs_class_term_cfgs: dict[str, list[ObservationTermCfg]] = dict()
     self._group_obs_concatenate: dict[str, bool] = dict()
     self._group_obs_concatenate_dim: dict[str, int] = dict()
-    self._group_obs_class_instances: dict[str, noise_model.NoiseModel] = {}
+    self._group_obs_class_instances: dict[str, dict[str, noise_model.NoiseModel]] = {}
     self._group_obs_term_delay_buffer: dict[str, dict[str, DelayBuffer]] = dict()
     self._group_obs_term_history_buffer: dict[str, dict[str, CircularBuffer]] = dict()
 
@@ -402,10 +426,15 @@ class ObservationManager(ManagerBase):
         print(f"group: {group_name} set to None, skipping...")
         continue
 
+      if not any(t is not None for t in group_cfg.terms.values()):
+        print(f"group: {group_name} has no active terms, skipping...")
+        continue
+
       self._group_obs_term_names[group_name] = list()
       self._group_obs_term_dim[group_name] = list()
       self._group_obs_term_cfgs[group_name] = list()
       self._group_obs_class_term_cfgs[group_name] = list()
+      self._group_obs_class_instances[group_name] = {}
       group_entry_delay_buffer: dict[str, DelayBuffer] = dict()
       group_entry_history_buffer: dict[str, CircularBuffer] = dict()
 
@@ -440,9 +469,9 @@ class ObservationManager(ManagerBase):
         obs_dims = tuple(term_cfg.func(self._env, **term_cfg.params).shape)
 
         if term_cfg.scale is not None:
-          term_cfg.scale = torch.tensor(
+          term_cfg.scale = torch.as_tensor(
             term_cfg.scale, dtype=torch.float, device=self._env.device
-          )
+          ).clone()
 
         if term_cfg.noise is not None and isinstance(
           term_cfg.noise, noise_cfg.NoiseModelCfg
@@ -452,7 +481,7 @@ class ObservationManager(ManagerBase):
             f"Class type for observation term '{term_name}' NoiseModelCfg"
             f" is not a subclass of 'NoiseModel'. Received: '{type(noise_model_cls)}'."
           )
-          self._group_obs_class_instances[term_name] = noise_model_cls(
+          self._group_obs_class_instances[group_name][term_name] = noise_model_cls(
             term_cfg.noise, num_envs=self._env.num_envs, device=self._env.device
           )
 
@@ -481,5 +510,6 @@ class ObservationManager(ManagerBase):
             obs_dims = (obs_dims[0], int(np.prod(obs_dims[1:])))
 
         self._group_obs_term_dim[group_name].append(obs_dims[1:])
+
       self._group_obs_term_delay_buffer[group_name] = group_entry_delay_buffer
       self._group_obs_term_history_buffer[group_name] = group_entry_history_buffer

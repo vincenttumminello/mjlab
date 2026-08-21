@@ -1,6 +1,7 @@
 """Tests for sim.py."""
 
 import mujoco
+import mujoco_warp as mjwarp
 import numpy as np
 import pytest
 import torch
@@ -47,7 +48,8 @@ def test_simulation_config_is_piped(robot_xml, device):
 
   cfg = SimulationCfg(
     contact_sensor_maxmatch=128,
-    ls_parallel=False,
+    broadphase="sap_tile",
+    broadphase_filter=("plane", "aabb"),
     mujoco=MujocoCfg(
       timestep=0.02,
       integrator="euler",
@@ -56,7 +58,7 @@ def test_simulation_config_is_piped(robot_xml, device):
       ls_iterations=14,
       ccd_iterations=20,
       gravity=(0, 0, 7.5),
-      multiccd=True,
+      enableflags=("energy",),
     ),
   )
 
@@ -70,7 +72,7 @@ def test_simulation_config_is_piped(robot_xml, device):
   assert sim.mj_model.opt.ls_iterations == cfg.mujoco.ls_iterations
   assert sim.mj_model.opt.ccd_iterations == cfg.mujoco.ccd_iterations
   assert tuple(sim.mj_model.opt.gravity) == cfg.mujoco.gravity
-  assert sim.mj_model.opt.enableflags & mujoco.mjtEnableBit.mjENBL_MULTICCD
+  assert sim.mj_model.opt.enableflags & mujoco.mjtEnableBit.mjENBL_ENERGY
 
   # MujocoCfg should be inherited by wp_model via put_model.
   np.testing.assert_almost_equal(
@@ -82,11 +84,31 @@ def test_simulation_config_is_piped(robot_xml, device):
   assert sim.model.opt.integrator == mujoco.mjtIntegrator.mjINT_EULER
   assert sim.model.opt.solver == mujoco.mjtSolver.mjSOL_CG
   assert sim.model.opt.iterations == cfg.mujoco.iterations
-  assert sim.model.opt.enableflags & mujoco.mjtEnableBit.mjENBL_MULTICCD
+  assert sim.model.opt.enableflags & mujoco.mjtEnableBit.mjENBL_ENERGY
 
-  # SimulationCfg should be applied to wp_model.
+  # SimulationCfg's warp-only settings should be applied to wp_model.opt.
   assert sim.wp_model.opt.contact_sensor_maxmatch == cfg.contact_sensor_maxmatch
-  assert sim.wp_model.opt.ls_parallel == cfg.ls_parallel
+  assert sim.wp_model.opt.broadphase == mjwarp.BroadphaseType.SAP_TILE
+  assert sim.wp_model.opt.broadphase_filter == (
+    mjwarp.BroadphaseFilter.PLANE | mjwarp.BroadphaseFilter.AABB
+  )
+
+
+def test_default_broadphase_keeps_put_model_heuristic(robot_xml, device):
+  """Unset broadphase settings should not override put_model's own heuristic."""
+  model = mujoco.MjModel.from_xml_string(robot_xml)
+  heuristic_opt = mjwarp.put_model(model).opt
+
+  sim = Simulation(num_envs=1, cfg=SimulationCfg(), model=model, device=device)
+
+  assert sim.wp_model.opt.broadphase == heuristic_opt.broadphase
+  assert sim.wp_model.opt.broadphase_filter == heuristic_opt.broadphase_filter
+
+
+def test_ls_parallel_is_deprecated():
+  """Setting the removed ls_parallel option warns instead of erroring."""
+  with pytest.warns(DeprecationWarning, match="ls_parallel"):
+    SimulationCfg(ls_parallel=True)
 
 
 def test_sim_reset_restores_initial_state(robot_xml, device):
@@ -136,3 +158,31 @@ def test_sim_reset_selective(robot_xml, device):
   # Envs 0 and 2 should be unchanged.
   torch.testing.assert_close(sim.data.qpos[0], qpos_after_sim[0])
   torch.testing.assert_close(sim.data.qpos[2], qpos_after_sim[2])
+
+
+def test_xpos_matches_qpos_after_forward(robot_xml, device):
+  """sim.step() leaves xpos stale; sim.forward() makes it match qpos.
+
+  In MuJoCo, mj_step = mj_step1 (forward kinematics + forces) + mj_step2
+  (integration). After mj_step, qpos/qvel are post-integration but xpos is
+  from the pre-integration forward pass. sim.forward() recomputes xpos from
+  the current qpos.
+  """
+  model = mujoco.MjModel.from_xml_string(robot_xml)
+  cfg = SimulationCfg(mujoco=MujocoCfg(timestep=0.01))  # Large dt for clear signal
+  sim = Simulation(num_envs=2, cfg=cfg, model=model, device=device)
+
+  # Step enough for significant velocity -> large staleness gap.
+  for _ in range(50):
+    sim.step()
+
+  # xpos is stale: reflects pre-integration state of last step.
+  # For the freejoint body (body 1), qpos[:3] is the true position.
+  xpos_stale = sim.data.xpos[:, 1].clone()
+  qpos_pos = sim.data.qpos[:, :3].clone()
+  assert not torch.allclose(xpos_stale, qpos_pos, atol=1e-4)
+
+  # forward() refreshes derived quantities from current qpos.
+  sim.forward()
+  xpos_fresh = sim.data.xpos[:, 1].clone()
+  torch.testing.assert_close(xpos_fresh, qpos_pos, atol=1e-5, rtol=0)

@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import copy
+
 import mujoco
 import pytest
 import torch
@@ -121,14 +123,20 @@ def test_accelerometer_sensor(articulated_robot_xml, device):
 
   scene = Scene(scene_cfg, device)
   model = scene.compile()
-  sim_cfg = SimulationCfg(njmax=20)
+  # The robot falls and rests on the floor here, generating contact
+  # constraints; njmax must accommodate the resting nefc (~32), unlike the
+  # other tests which only step once before the robot lands.
+  sim_cfg = SimulationCfg(njmax=40)
   sim = Simulation(num_envs=2, cfg=sim_cfg, model=model, device=device)
   scene.initialize(sim.mj_model, sim.model, sim.data)
 
   sensor = scene["robot/base_accel"]
 
-  # Step to make robot fall.
-  for _ in range(100):
+  # Step until the robot falls (from z=1) and rests on the floor. During free
+  # fall the accelerometer correctly reads ~0 (zero proper acceleration); it
+  # only registers the ~g ground reaction once the robot has landed (~280
+  # steps), so step well past that.
+  for _ in range(400):
     sim.step()
 
   data = sensor.data
@@ -354,3 +362,17 @@ def test_cutoff_parameter(articulated_robot_xml, device):
 
   sensor = sim.mj_model.sensor("robot/joint1_pos")
   assert sensor.cutoff[0] == 0.01
+
+
+def test_deepcopy_no_double_prefix():
+  """Regression test for #850: deepcopy should not double-prefix sensor name."""
+  cfg = BuiltinSensorCfg(
+    name="joint1_pos",
+    sensor_type="jointpos",
+    obj=ObjRef(type="joint", name="joint1", entity="robot"),
+  )
+  assert cfg.prefixed_name == "robot/joint1_pos"
+
+  cfg_copy = copy.deepcopy(cfg)
+  assert cfg_copy.prefixed_name == "robot/joint1_pos"
+  assert cfg_copy.name == "joint1_pos"

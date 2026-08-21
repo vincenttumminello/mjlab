@@ -72,9 +72,28 @@ def test_foot_collision_geoms(go1_model) -> None:
   for i in range(go1_model.ngeom):
     geom = go1_model.geom(i)
     if re.match(foot_pattern, geom.name):
-      assert geom.condim == 3
+      assert geom.condim == 6
       assert geom.priority == 1
-      assert geom.friction[0] == 0.6
+      assert geom.friction[0] == 1.0
+
+
+def test_all_collision_geoms_enabled(go1_model) -> None:
+  """Every *_collision geom, including numbered ones, must stay collidable.
+
+  The go1 XML numbers its secondary collision capsules (FR_thigh_collision1,
+  ...), which a pattern anchored at "_collision" would silently drop, letting
+  disable_other_geoms zero their contype. Guard against that regression with
+  an oracle independent of the config's own regex resolution.
+  """
+  collision_geoms = [
+    go1_model.geom(i)
+    for i in range(go1_model.ngeom)
+    if "_collision" in go1_model.geom(i).name
+  ]
+  assert len(collision_geoms) == 30
+  for geom in collision_geoms:
+    assert geom.contype == 1, f"{geom.name} lost its contype"
+    assert geom.conaffinity == 1, f"{geom.name} lost its conaffinity"
 
 
 def test_collision_geom_count(go1_model) -> None:

@@ -9,6 +9,7 @@ import torch
 import warp as wp
 
 from mjlab.entity import Entity, EntityArticulationInfoCfg, EntityCfg
+from mjlab.scene import Scene, SceneCfg
 from mjlab.sim.sim import Simulation, SimulationCfg
 
 
@@ -101,6 +102,40 @@ def initialize_entity(entity: Entity, device: str, num_envs: int = 1):
   sim = Simulation(num_envs=num_envs, cfg=sim_cfg, model=model, device=device)
   entity.initialize(model, sim.model, sim.data, device)
   return entity, sim
+
+
+def make_scene_and_sim(
+  device: str,
+  xml: str | dict[str, str],
+  sensors: tuple,
+  num_envs: int = 1,
+  sim_cfg: SimulationCfg | None = None,
+) -> tuple[Scene, Simulation]:
+  """Create a scene and simulation from inline XML with sensors wired up.
+
+  ``xml`` may be a single XML string (registered as the ``robot`` entity) or a
+  mapping of entity name to XML string for multi-entity scenes.
+  """
+  xml_by_entity = {"robot": xml} if isinstance(xml, str) else xml
+  entities = {
+    name: EntityCfg(spec_fn=lambda s=s: mujoco.MjSpec.from_string(s))
+    for name, s in xml_by_entity.items()
+  }
+  scene_cfg = SceneCfg(
+    num_envs=num_envs,
+    env_spacing=5.0,
+    entities=entities,
+    sensors=sensors,
+  )
+  scene = Scene(scene_cfg, device)
+  model = scene.compile()
+  if sim_cfg is None:
+    sim_cfg = SimulationCfg(njmax=20)
+  sim = Simulation(num_envs=num_envs, cfg=sim_cfg, model=model, device=device)
+  scene.initialize(sim.mj_model, sim.model, sim.data)
+  if scene.sensor_context is not None:
+    sim.set_sensor_context(scene.sensor_context)
+  return scene, sim
 
 
 # =============================================================================

@@ -1,7 +1,8 @@
 from __future__ import annotations
 
+from collections.abc import Callable
 from dataclasses import dataclass, field
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 import numpy as np
 import torch
@@ -10,21 +11,25 @@ from mjlab.entity import Entity
 from mjlab.managers.command_manager import CommandTerm, CommandTermCfg
 from mjlab.utils.lab_api.math import (
   matrix_from_quat,
-  quat_apply,
   wrap_to_pi,
 )
 
 if TYPE_CHECKING:
+  import viser
+
   from mjlab.envs.manager_based_rl_env import ManagerBasedRlEnv
   from mjlab.viewer.debug_visualizer import DebugVisualizer
 
 
 class UniformVelocityCommand(CommandTerm):
+  """Command term for sampling uniform velocity commands for robot control."""
+
   cfg: UniformVelocityCommandCfg
 
   def __init__(self, cfg: UniformVelocityCommandCfg, env: ManagerBasedRlEnv):
     super().__init__(cfg, env)
 
+    # Validate heading command configuration
     if self.cfg.heading_command and self.cfg.ranges.heading is None:
       raise ValueError("heading_command=True but ranges.heading is set to None.")
     if self.cfg.ranges.heading and not self.cfg.heading_command:
@@ -32,72 +37,208 @@ class UniformVelocityCommand(CommandTerm):
 
     self.robot: Entity = env.scene[cfg.entity_name]
 
+    # Initialize velocity command buffer (x, y linear + z angular)
     self.vel_command_b = torch.zeros(self.num_envs, 3, device=self.device)
+    # vel_command_w
+    self.vel_command_w = torch.zeros(self.num_envs, 3, device=self.device)
+    # Target heading angle for heading control mode
     self.heading_target = torch.zeros(self.num_envs, device=self.device)
+    # Current heading error from target
     self.heading_error = torch.zeros(self.num_envs, device=self.device)
+    # Mask for environments using heading control
     self.is_heading_env = torch.zeros(
       self.num_envs, dtype=torch.bool, device=self.device
     )
+    # Mask for environments that should stand still
     self.is_standing_env = torch.zeros_like(self.is_heading_env)
+    self.is_world_env = torch.zeros_like(self.is_heading_env)
+    self.is_forward_env = torch.zeros_like(self.is_heading_env)
 
+    # Initialize tracking metrics
     self.metrics["error_vel_xy"] = torch.zeros(self.num_envs, device=self.device)
     self.metrics["error_vel_yaw"] = torch.zeros(self.num_envs, device=self.device)
+    self.metrics["error_vel_x"] = torch.zeros(self.num_envs, device=self.device)
+    self.metrics["error_vel_y"] = torch.zeros(self.num_envs, device=self.device)
+
+    # Set by create_gui() when the viewer is active.
+    self._joystick_enabled: viser.GuiCheckboxHandle | None = None
+    self._joystick_sliders: list[viser.GuiSliderHandle] = []
+    self._joystick_get_env_idx: Callable[[], int] | None = None
 
   @property
   def command(self) -> torch.Tensor:
+    """Returns the current velocity command in body frame."""
     return self.vel_command_b
 
   def _update_metrics(self) -> None:
+    """Accumulate velocity tracking errors for metrics."""
     max_command_time = self.cfg.resampling_time_range[1]
     max_command_step = max_command_time / self._env.step_dt
+    # Accumulate normalized xy linear velocity error
     self.metrics["error_vel_xy"] += (
       torch.norm(
         self.vel_command_b[:, :2] - self.robot.data.root_link_lin_vel_b[:, :2], dim=-1
       )
       / max_command_step
     )
+    # Accumulate normalized yaw angular velocity error
     self.metrics["error_vel_yaw"] += (
       torch.abs(self.vel_command_b[:, 2] - self.robot.data.root_link_ang_vel_b[:, 2])
       / max_command_step
     )
+    # Accumulate separate x and y linear velocity errors for analysis
+    self.metrics["error_vel_x"] += (
+      torch.abs(self.vel_command_b[:, 0] - self.robot.data.root_link_lin_vel_b[:, 0])
+      / max_command_step
+    )
+    self.metrics["error_vel_y"] += (
+      torch.abs(self.vel_command_b[:, 1] - self.robot.data.root_link_lin_vel_b[:, 1])
+      / max_command_step
+    )
 
   def _resample_command(self, env_ids: torch.Tensor) -> None:
+    """Sample new velocity commands for specified environments."""
     r = torch.empty(len(env_ids), device=self.device)
+    # Sample linear and angular velocity commands from uniform distributions
     self.vel_command_b[env_ids, 0] = r.uniform_(*self.cfg.ranges.lin_vel_x)
     self.vel_command_b[env_ids, 1] = r.uniform_(*self.cfg.ranges.lin_vel_y)
     self.vel_command_b[env_ids, 2] = r.uniform_(*self.cfg.ranges.ang_vel_z)
+
+    # Sample heading targets if heading control is enabled
     if self.cfg.heading_command:
       assert self.cfg.ranges.heading is not None
       self.heading_target[env_ids] = r.uniform_(*self.cfg.ranges.heading)
       self.is_heading_env[env_ids] = r.uniform_(0.0, 1.0) <= self.cfg.rel_heading_envs
+
+    # Randomly select environments to stand still
     self.is_standing_env[env_ids] = r.uniform_(0.0, 1.0) <= self.cfg.rel_standing_envs
 
-    init_vel_mask = r.uniform_(0.0, 1.0) < self.cfg.init_velocity_prob
-    init_vel_env_ids = env_ids[init_vel_mask]
-    if len(init_vel_env_ids) > 0:
-      root_pos = self.robot.data.root_link_pos_w[init_vel_env_ids]
-      root_quat = self.robot.data.root_link_quat_w[init_vel_env_ids]
-      lin_vel_b = self.robot.data.root_link_lin_vel_b[init_vel_env_ids]
-      lin_vel_b[:, :2] = self.vel_command_b[init_vel_env_ids, :2]
-      root_lin_vel_w = quat_apply(root_quat, lin_vel_b)
-      root_ang_vel_b = self.robot.data.root_link_ang_vel_b[init_vel_env_ids]
-      root_ang_vel_b[:, 2] = self.vel_command_b[init_vel_env_ids, 2]
-      root_state = torch.cat(
-        [root_pos, root_quat, root_lin_vel_w, root_ang_vel_b], dim=-1
-      )
-      self.robot.write_root_state_to_sim(root_state, init_vel_env_ids)
+    # Randomly assign world-frame envs.
+    self.is_world_env[env_ids] = r.uniform_(0.0, 1.0) <= self.cfg.rel_world_envs
+    # Copy sampled velocities as world-frame reference for world envs.
+    self.vel_command_w[env_ids] = self.vel_command_b[env_ids]
 
-  def _update_command(self) -> None:
+    # Forward-only envs: positive lin_vel_x, zero lateral and angular.
+    self.is_forward_env[env_ids] = r.uniform_(0.0, 1.0) <= self.cfg.rel_forward_envs
+    fwd_ids = env_ids[self.is_forward_env[env_ids]]
+    if len(fwd_ids) > 0:
+      self.vel_command_b[fwd_ids, 0] = (
+        self.vel_command_b[fwd_ids, 0].abs().clamp(min=0.3)
+      )
+      self.vel_command_b[fwd_ids, 1] = 0.0
+      self.vel_command_b[fwd_ids, 2] = 0.0
+
+  def reset(self, env_ids: torch.Tensor | slice | None) -> dict[str, float]:
+    extras = super().reset(env_ids)
+    if self.cfg.init_velocity_prob > 0.0:
+      assert isinstance(env_ids, torch.Tensor)
+      r = torch.empty(len(env_ids), device=self.device)
+      init_ids = env_ids[r.uniform_(0.0, 1.0) < self.cfg.init_velocity_prob]
+      if len(init_ids) > 0:
+        # Start these envs already moving at the commanded planar velocity.
+        # Safe pre-forward: the body-frame write reads orientation from qpos.
+        vel_b = torch.zeros(len(init_ids), 6, device=self.device)
+        vel_b[:, :2] = self.vel_command_b[init_ids, :2]
+        vel_b[:, 5] = self.vel_command_b[init_ids, 2]
+        self.robot.write_root_link_velocity_b_to_sim(vel_b, env_ids=init_ids)
+    return extras
+
+  def _update_command(self, env_ids: torch.Tensor | None = None) -> None:
+    # Pure function of the current state; refreshing all envs is safe.
+    del env_ids
     if self.cfg.heading_command:
       self.heading_error = wrap_to_pi(self.heading_target - self.robot.data.heading_w)
-      env_ids = self.is_heading_env.nonzero(as_tuple=False).flatten()
-      self.vel_command_b[env_ids, 2] = torch.clip(
-        self.cfg.heading_control_stiffness * self.heading_error[env_ids],
+      heading_ids = self.is_heading_env.nonzero(as_tuple=False).flatten()
+      self.vel_command_b[heading_ids, 2] = torch.clip(
+        self.cfg.heading_control_stiffness * self.heading_error[heading_ids],
         min=self.cfg.ranges.ang_vel_z[0],
         max=self.cfg.ranges.ang_vel_z[1],
       )
+    # World-frame envs: rotate world-frame linear vel into body frame.
+    if self.is_world_env.any():
+      w_ids = self.is_world_env.nonzero(as_tuple=False).flatten()
+      heading = self.robot.data.heading_w[w_ids]
+      cos_h = torch.cos(heading)
+      sin_h = torch.sin(heading)
+      vx_w = self.vel_command_w[w_ids, 0]
+      vy_w = self.vel_command_w[w_ids, 1]
+      self.vel_command_b[w_ids, 0] = cos_h * vx_w + sin_h * vy_w
+      self.vel_command_b[w_ids, 1] = -sin_h * vx_w + cos_h * vy_w
+
+    # Zero out commands for standing environments
     standing_env_ids = self.is_standing_env.nonzero(as_tuple=False).flatten()
     self.vel_command_b[standing_env_ids, :] = 0.0
+    self.vel_command_w[standing_env_ids, :] = 0.0
+
+  # GUI.
+
+  def create_gui(
+    self,
+    name: str,
+    server: viser.ViserServer,
+    get_env_idx: Callable[[], int],
+    on_change: Callable[[], None] | None = None,
+    request_action: Callable[[str, Any], None] | None = None,
+  ) -> None:
+    """Create velocity joystick sliders in the Viser viewer."""
+    from viser import Icon
+
+    ranges = self.cfg.ranges
+
+    axes = [
+      ("lin_vel_x", ranges.lin_vel_x[1]),
+      ("lin_vel_y", ranges.lin_vel_y[1]),
+      ("ang_vel_z", ranges.ang_vel_z[1]),
+    ]
+    sliders: list = []
+
+    with server.gui.add_folder(name.capitalize()):
+      enabled = server.gui.add_checkbox("Enable", initial_value=False)
+
+      for label, max_val in axes:
+        max_input = server.gui.add_slider(
+          f"Max {label}",
+          initial_value=max(0.0, min(10.0, max_val)),
+          step=0.1,
+          min=0.0,
+          max=10.0,
+        )
+        slider = server.gui.add_slider(
+          label,
+          min=-max_val,
+          max=max_val,
+          step=0.05,
+          initial_value=0.0,
+        )
+
+        @max_input.on_update
+        def _(_ev, _s=slider, _m=max_input) -> None:
+          _s.min = -_m.value
+          _s.max = _m.value
+
+        sliders.append(slider)
+
+      zero_btn = server.gui.add_button("Zero", icon=Icon.SQUARE_X)
+
+      @zero_btn.on_click
+      def _(_) -> None:
+        for s in sliders:
+          s.value = 0.0
+
+    # Store GUI state for compute() override.
+    self._joystick_enabled = enabled
+    self._joystick_sliders = sliders
+    self._joystick_get_env_idx = get_env_idx
+
+  def compute(
+    self, dt: float | torch.Tensor, env_ids: torch.Tensor | None = None
+  ) -> None:
+    super().compute(dt, env_ids)
+    if self._joystick_enabled is not None and self._joystick_enabled.value:
+      assert self._joystick_get_env_idx is not None
+      idx = self._joystick_get_env_idx()
+      for i, s in enumerate(self._joystick_sliders):
+        self.vel_command_b[idx, i] = s.value
 
   # Visualization.
 
@@ -107,6 +248,7 @@ class UniformVelocityCommand(CommandTerm):
     if not env_indices:
       return
 
+    # Convert data to numpy for visualization
     cmds = self.command.cpu().numpy()
     base_pos_ws = self.robot.data.root_link_pos_w.cpu().numpy()
     base_quat_w = self.robot.data.root_link_quat_w
@@ -178,28 +320,44 @@ class UniformVelocityCommandCfg(CommandTermCfg):
   heading_control_stiffness: float = 1.0
   rel_standing_envs: float = 0.0
   rel_heading_envs: float = 1.0
+  rel_world_envs: float = 0.0
+  """Fraction of environments that use world-frame velocity commands.
+  World-frame envs sample linear velocity in world frame and rotate to body
+  frame each step, so the command direction stays fixed in the world."""
+  rel_forward_envs: float = 0.0
+  """Fraction of environments that receive forward-only commands (positive
+  lin_vel_x, zero lin_vel_y and ang_vel_z). Increases training coverage for
+  straight-line walking, which is important for stair climbing."""
   init_velocity_prob: float = 0.0
+  """Probability that an env starts its episode already moving at its sampled
+  planar command velocity. Applied on reset only."""
 
   @dataclass
   class Ranges:
-    lin_vel_x: tuple[float, float]
-    lin_vel_y: tuple[float, float]
-    ang_vel_z: tuple[float, float]
-    heading: tuple[float, float] | None = None
+    """Sampling ranges for velocity commands."""
+
+    lin_vel_x: tuple[float, float]  # Forward/backward linear velocity range
+    lin_vel_y: tuple[float, float]  # Left/right linear velocity range
+    ang_vel_z: tuple[float, float]  # Yaw angular velocity range
+    heading: tuple[float, float] | None = None  # Target heading angle range
 
   ranges: Ranges
 
   @dataclass
   class VizCfg:
-    z_offset: float = 0.2
-    scale: float = 0.5
+    """Visualization configuration."""
+
+    z_offset: float = 0.2  # Height offset for arrows above robot
+    scale: float = 0.5  # Scale factor for arrow lengths
 
   viz: VizCfg = field(default_factory=VizCfg)
 
   def build(self, env: ManagerBasedRlEnv) -> UniformVelocityCommand:
+    """Construct the velocity command term."""
     return UniformVelocityCommand(self, env)
 
   def __post_init__(self):
+    """Validate configuration after initialization."""
     if self.heading_command and self.ranges.heading is None:
       raise ValueError(
         "The velocity command has heading commands active (heading_command=True) but "
